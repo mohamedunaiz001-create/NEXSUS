@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { safeLogger, sendSecureError } from './security';
+import { createSession, isSessionActive, revokeSession as revokeStoredSession, revokeAllUserSessions as revokeStoredUserSessions } from './database';
 
 const isProduction = process.env.NODE_ENV === 'production';
 
@@ -21,10 +22,6 @@ export type UserRole = 'Admin' | 'Analyst' | 'Viewer' | 'Agent';
 export interface UserPayload { id: string; name: string; email: string; role: UserRole; badge: string; clearance: 'TOP_SECRET' | 'SECRET' | 'CONFIDENTIAL' | 'RESTRICTED'; }
 export interface AuthenticatedRequest extends Request { user?: UserPayload; requestId?: string; csrfToken?: string; sessionId?: string; }
 interface StoredAccount { user: UserPayload; salt: string; passwordHash: string; }
-
-// Server-side revocation state. This invalidates stolen JWTs before their normal expiry.
-// For multi-instance production deployments, replace this in-memory set with shared session storage.
-const revokedSessionIds = new Set<string>();
 
 function hashPassword(password: string, salt: string): string { return crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex'); }
 function resolveInitialPassword(envValue: string | undefined, envVarName: string): string | null {
@@ -62,22 +59,13 @@ export function verifyUserCredentials(email: string, passwordAttempt: string): U
 
 export function generateAuthToken(user: UserPayload): string {
   const sessionId = crypto.randomUUID();
-  return jwt.sign(
-    { sub:user.id, name:user.name, email:user.email, role:user.role, badge:user.badge, clearance:user.clearance, jti:sessionId },
-    JWT_SECRET,
-    { expiresIn:'8h', algorithm:'HS256' }
-  );
+  const expiresAt = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString();
+  createSession(sessionId, user.id, expiresAt);
+  return jwt.sign({ sub:user.id, name:user.name, email:user.email, role:user.role, badge:user.badge, clearance:user.clearance, jti:sessionId }, JWT_SECRET, { expiresIn:'8h', algorithm:'HS256' });
 }
 
-export function revokeSession(sessionId: string): void {
-  if (sessionId) revokedSessionIds.add(sessionId);
-}
-
-export function revokeAllUserSessions(userId: string): void {
-  // Existing JWTs are stateless; future production deployments should persist sessions.
-  // This hook is retained so password changes can be wired to shared session storage.
-  safeLogger.info('Session revocation requested for user', { userId });
-}
+export function revokeSession(sessionId: string): void { if (sessionId) revokeStoredSession(sessionId); }
+export function revokeAllUserSessions(userId: string): void { if (userId) revokeStoredUserSessions(userId); }
 
 export function generateCsrfToken(): string { const randomValue=crypto.randomBytes(32).toString('hex'); const timestamp=Date.now().toString(); const signature=crypto.createHmac('sha256',CSRF_SECRET).update(`${randomValue}:${timestamp}`).digest('hex'); return `${randomValue}.${timestamp}.${signature}`; }
 export function validateCsrfToken(token: string): boolean {
@@ -90,7 +78,7 @@ export function authenticateToken(req: AuthenticatedRequest,res: Response,next: 
   try {
     const decoded=jwt.verify(token,JWT_SECRET,{algorithms:['HS256']}) as any;
     if(!decoded?.sub||!decoded?.role||!decoded?.jti)return sendSecureError(res,401,'Invalid session payload structure.','INVALID_TOKEN_PAYLOAD');
-    if(revokedSessionIds.has(decoded.jti)) return sendSecureError(res,401,'Session has been revoked. Please log in again.','SESSION_REVOKED');
+    if(!isSessionActive(decoded.jti)) return sendSecureError(res,401,'Session is expired or has been revoked. Please log in again.','SESSION_INVALID');
     req.sessionId=decoded.jti;
     req.user={id:decoded.sub,name:decoded.name||'Unknown Operator',email:decoded.email||'',role:decoded.role as UserRole,badge:decoded.badge||'SOC OPERATOR',clearance:decoded.clearance||'CONFIDENTIAL'}; return next();
   }
