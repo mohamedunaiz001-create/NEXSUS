@@ -1,8 +1,0 @@
-{
-  "name": "CyberResearch-X Command Center",
-  "description": "AI Cybersecurity OS Command Center with CEO Orchestrator Archon, 8 specialist agent hierarchy, live threat intelligence, and mission tracking.",
-  "requestFramePermissions": [
-    "microphone"
-  ],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_AI_API"]
-}
