@@ -19,8 +19,12 @@ const CSRF_SECRET = requireSecret('CSRF_SECRET');
 
 export type UserRole = 'Admin' | 'Analyst' | 'Viewer' | 'Agent';
 export interface UserPayload { id: string; name: string; email: string; role: UserRole; badge: string; clearance: 'TOP_SECRET' | 'SECRET' | 'CONFIDENTIAL' | 'RESTRICTED'; }
-export interface AuthenticatedRequest extends Request { user?: UserPayload; requestId?: string; csrfToken?: string; }
+export interface AuthenticatedRequest extends Request { user?: UserPayload; requestId?: string; csrfToken?: string; sessionId?: string; }
 interface StoredAccount { user: UserPayload; salt: string; passwordHash: string; }
+
+// Server-side revocation state. This invalidates stolen JWTs before their normal expiry.
+// For multi-instance production deployments, replace this in-memory set with shared session storage.
+const revokedSessionIds = new Set<string>();
 
 function hashPassword(password: string, salt: string): string { return crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex'); }
 function resolveInitialPassword(envValue: string | undefined, envVarName: string): string | null {
@@ -55,7 +59,26 @@ export function verifyUserCredentials(email: string, passwordAttempt: string): U
   const attempt=Buffer.from(hashPassword(passwordAttempt,account.salt),'hex'); const expected=Buffer.from(account.passwordHash,'hex');
   if (attempt.length!==expected.length) return null; return crypto.timingSafeEqual(expected,attempt) ? account.user : null;
 }
-export function generateAuthToken(user: UserPayload): string { return jwt.sign({sub:user.id,name:user.name,email:user.email,role:user.role,badge:user.badge,clearance:user.clearance},JWT_SECRET,{expiresIn:'8h',algorithm:'HS256'}); }
+
+export function generateAuthToken(user: UserPayload): string {
+  const sessionId = crypto.randomUUID();
+  return jwt.sign(
+    { sub:user.id, name:user.name, email:user.email, role:user.role, badge:user.badge, clearance:user.clearance, jti:sessionId },
+    JWT_SECRET,
+    { expiresIn:'8h', algorithm:'HS256' }
+  );
+}
+
+export function revokeSession(sessionId: string): void {
+  if (sessionId) revokedSessionIds.add(sessionId);
+}
+
+export function revokeAllUserSessions(userId: string): void {
+  // Existing JWTs are stateless; future production deployments should persist sessions.
+  // This hook is retained so password changes can be wired to shared session storage.
+  safeLogger.info('Session revocation requested for user', { userId });
+}
+
 export function generateCsrfToken(): string { const randomValue=crypto.randomBytes(32).toString('hex'); const timestamp=Date.now().toString(); const signature=crypto.createHmac('sha256',CSRF_SECRET).update(`${randomValue}:${timestamp}`).digest('hex'); return `${randomValue}.${timestamp}.${signature}`; }
 export function validateCsrfToken(token: string): boolean {
   if (!token || typeof token!=='string') return false; const parts=token.split('.'); if(parts.length!==3)return false; const [randomValue,timestamp,signature]=parts; const timeNum=Number(timestamp); if(!Number.isSafeInteger(timeNum))return false; const age=Date.now()-timeNum; if(age<0 || age>8*3600*1000)return false; if(!/^[a-f0-9]{64}$/i.test(randomValue)||!/^[a-f0-9]{64}$/i.test(signature))return false;
@@ -64,7 +87,13 @@ export function validateCsrfToken(token: string): boolean {
 export function authenticateToken(req: AuthenticatedRequest,res: Response,next: NextFunction) {
   const authHeader=req.headers.authorization; let token=authHeader?.startsWith('Bearer ')?authHeader.substring(7).trim():null; if(!token) token=req.cookies?.nexsus_session;
   if(!token)return sendSecureError(res,401,'Authentication required. No valid session or authorization token provided.','AUTH_REQUIRED');
-  try { const decoded=jwt.verify(token,JWT_SECRET,{algorithms:['HS256']}) as any; if(!decoded?.sub||!decoded?.role)return sendSecureError(res,401,'Invalid session payload structure.','INVALID_TOKEN_PAYLOAD'); req.user={id:decoded.sub,name:decoded.name||'Unknown Operator',email:decoded.email||'',role:decoded.role as UserRole,badge:decoded.badge||'SOC OPERATOR',clearance:decoded.clearance||'CONFIDENTIAL'}; return next(); }
+  try {
+    const decoded=jwt.verify(token,JWT_SECRET,{algorithms:['HS256']}) as any;
+    if(!decoded?.sub||!decoded?.role||!decoded?.jti)return sendSecureError(res,401,'Invalid session payload structure.','INVALID_TOKEN_PAYLOAD');
+    if(revokedSessionIds.has(decoded.jti)) return sendSecureError(res,401,'Session has been revoked. Please log in again.','SESSION_REVOKED');
+    req.sessionId=decoded.jti;
+    req.user={id:decoded.sub,name:decoded.name||'Unknown Operator',email:decoded.email||'',role:decoded.role as UserRole,badge:decoded.badge||'SOC OPERATOR',clearance:decoded.clearance||'CONFIDENTIAL'}; return next();
+  }
   catch(err:any){ safeLogger.warn('JWT verification failed',{error:err.message}); return sendSecureError(res,401,err.name==='TokenExpiredError'?'Session token has expired. Please log in again.':'Invalid session token signature.',err.name==='TokenExpiredError'?'TOKEN_EXPIRED':'TOKEN_INVALID'); }
 }
 export function requireRole(allowedRoles: UserRole[]) { return (req: AuthenticatedRequest,res: Response,next: NextFunction)=>{ if(!req.user)return sendSecureError(res,401,'Authentication required before verifying role authorization.','UNAUTHENTICATED'); if(!allowedRoles.includes(req.user.role)){safeLogger.warn('Access denied: insufficient privileges',{userId:req.user.id,userRole:req.user.role,requiredRoles:allowedRoles,path:req.originalUrl});return sendSecureError(res,403,`Access denied. Role '${req.user.role}' lacks required permissions.`,'FORBIDDEN_ROLE');} return next();}; }
