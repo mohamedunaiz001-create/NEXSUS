@@ -2,16 +2,18 @@
 node_modules/
 
 # --- Environment / secrets ---
-# Never commit real env files — only .env.example should be tracked.
 .env
-.env.local
-.env.*.local
-.env.development
-.env.production
-.env.test
+.env.*
+!.env.example
 *.pem
 *.key
-!*.example
+
+# --- Runtime / database data ---
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+uploads/
 
 # --- Build output ---
 dist/
@@ -36,7 +38,6 @@ coverage/
 *.swp
 *.swo
 .DS_Store
-.DS_Store?
 ._*
 Thumbs.db
 ehthumbs.db
