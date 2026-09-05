@@ -14,11 +14,14 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 async function startServer() {
   if (isProduction) {
-    const required = ['JWT_SECRET', 'CSRF_SECRET', 'ALLOWED_ORIGINS'];
+    const required = ['JWT_SECRET', 'CSRF_SECRET', 'ALLOWED_ORIGINS', 'TOOL_ENCRYPTION_KEY'];
     const missing = required.filter(name => !process.env[name]?.trim());
     if (missing.length) throw new Error(`Missing required production environment variables: ${missing.join(', ')}`);
     if ((process.env.JWT_SECRET || '').length < 64 || (process.env.CSRF_SECRET || '').length < 64) {
       throw new Error('JWT_SECRET and CSRF_SECRET must each be at least 64 characters in production.');
+    }
+    if (!/^[0-9a-fA-F]{64}$/.test(process.env.TOOL_ENCRYPTION_KEY || '')) {
+      throw new Error('TOOL_ENCRYPTION_KEY must be a 64-character hex string (32 bytes) in production. Generate with: openssl rand -hex 32');
     }
   }
 
@@ -67,11 +70,13 @@ async function startServer() {
   const globalLimiter = rateLimit({ windowMs: 60 * 1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { success: false, error: 'Too many requests. Please slow down.', code: 'RATE_LIMIT_EXCEEDED' } });
   const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false, message: { success: false, error: 'AI request limit reached (max 30/min).', code: 'AI_RATE_LIMIT_EXCEEDED' } });
   const authLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: { success: false, error: 'Too many authentication attempts.', code: 'AUTH_RATE_LIMIT_EXCEEDED' } });
+  const toolExecuteLimiter = rateLimit({ windowMs: 60 * 1000, max: 40, standardHeaders: true, legacyHeaders: false, message: { success: false, error: 'Tool execution limit reached (max 40/min).', code: 'TOOL_RATE_LIMIT_EXCEEDED' } });
 
   app.use('/api/', globalLimiter);
   app.use('/api/ai/', aiLimiter);
   app.use('/api/auth/login', authLimiter);
   app.use('/api/auth/bootstrap', authLimiter);
+  app.use('/api/tools/execute', toolExecuteLimiter);
 
   app.use((req, res, next) => {
     if (req.path.startsWith('/api/')) {
